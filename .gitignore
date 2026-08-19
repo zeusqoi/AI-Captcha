@@ -1,2 +1,3 @@
 .env
 Prompt.md
+__pycache__/
