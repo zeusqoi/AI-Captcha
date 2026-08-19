@@ -50,17 +50,32 @@ locust -f locustfile.py --host http://127.0.0.1:8000
 
 브라우저에서 `http://localhost:8089` 열어서 동시 사용자 수·시간 입력 후 시작.
 
-## 실제 운영/스테이징 엔드포인트 (DB·인증 포함, k6)
+## 실제 운영 엔드포인트 (DB·인증 포함, k6)
 
-k6는 [k6.io](https://k6.io/docs/get-started/installation/)에서 설치.
+k6는 [k6.io](https://k6.io/docs/get-started/installation/)에서 설치(Windows는 `winget install k6.k6`도 가능).
+
+**주의**: 이건 실제 프로덕션(vlur.site)에 진짜 요청을 보내는 스크립트다. 호출마다 실제 DB에 행이 쌓이고 요금제 월 호출 한도도 소모된다. 그래서 기본 시나리오는 5 VU·15초짜리 작은 테스트로 맞춰뒀다 — 먼저 이걸로 인증이 맞는지부터 확인할 것.
+
+준비물:
+1. 마이페이지 > API Key 관리에서 Site Key 발급
+2. 그 Site Key에 등록한 도메인을 확인 — 테스트 편하게 하려면 "localhost"로 등록해두기
+3. `ORIGIN` 환경변수를 그 등록 도메인과 정확히 맞추기 (서버가 Origin/Referer 헤더로 도메인을 검증함, `backend/auth/site_key.py`)
 
 ```
-set BASE_URL=https://vlur.site
-set SITE_KEY=실제_사이트키
+$env:BASE_URL="https://vlur.site"
+$env:SITE_KEY="실제_사이트키"
+$env:ORIGIN="http://localhost"   # Site Key에 등록한 도메인과 일치해야 함
 k6 run k6_script.js
 ```
 
-티켓팅 오픈 순간처럼 짧게 사용자가 몰리는 스파이크 시나리오(`ramping-vus`)가 기본으로 들어가 있음.
+`challenge 실패` 로그가 뜨면 대부분 Site Key 오타이거나 ORIGIN이 등록 도메인과 안 맞는 경우다 — 콘솔에 실제 status/body가 같이 출력된다.
+
+작은 테스트로 200이 잘 나오는 걸 확인한 뒤에만, 티켓팅 오픈 스파이크(최대 300 VU) 시나리오를 명시적으로 켤 수 있다:
+
+```
+$env:SCENARIO="spike"
+k6 run k6_script.js
+```
 
 ## 참고 — 실측 결과 (2026-08-19)
 

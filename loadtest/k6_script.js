@@ -2,28 +2,51 @@
 // DB 왕복(usage_daily_stats, captchas insert 등)과 site_key 인증까지 전부 포함된
 // "진짜" /challenge -> /verify 흐름을 그대로 재현한다.
 //
+// !! 실제 프로덕션(vlur.site)에 진짜 트래픽을 만드는 스크립트다 !!
+//   - 호출마다 실제 DB에 행이 쌓이고(captchas, captcha_verifications), 사용량 집계(usage_daily_stats)에도
+//     반영된다 — 요금제에 월 호출 한도가 있다면 그 한도를 갉아먹는다.
+//   - 그래서 기본값은 5 VU · 15초짜리 작은 테스트로 맞춰뒀다. 규모를 키우기 전에 반드시 이 작은
+//     테스트로 먼저 인증(Site Key/Origin)이 맞는지, 200이 오는지부터 확인할 것.
+//   - 티켓팅 스파이크(수백 VU) 시나리오를 쓰려면 아래 SCENARIO=spike 환경변수로 명시적으로 켜야 한다.
+//
 // 실행 전 준비물:
-//   1. 마이페이지 > API Key 관리에서 발급받은 Site Key (X-Site-Key 헤더 or 문서 확인해서 실제 헤더명 맞추기)
-//   2. 등록된 도메인과 origin 헤더가 맞아야 CORS/검증 통과 (staging이면 localhost 등록해서 사용)
+//   1. 마이페이지 > API Key 관리에서 Site Key 발급 (X-Site-Key 헤더로 보냄)
+//   2. 그 Site Key에 등록한 도메인과 아래 ORIGIN 값이 정확히 일치해야 한다. 서버가 Origin/Referer
+//      헤더의 호스트명을 등록 도메인과 그대로 비교하기 때문에(backend/auth/site_key.py), 이게 안 맞으면
+//      403(허용 도메인 불일치)이 난다. 테스트용으로는 등록 도메인을 "localhost"로 해두는 게 제일 간단.
 //
-// 실행:
+// 실행 (작은 테스트, 기본값 — 먼저 이걸로):
+//   $env:BASE_URL="https://vlur.site"
+//   $env:SITE_KEY="실제_사이트키"
+//   $env:ORIGIN="http://localhost"      # Site Key에 등록한 도메인과 맞출 것
+//   k6 run k6_script.js
+//
+// 실행 (규모를 키운 스파이크 시나리오, 위 작은 테스트로 200 확인 후에만):
+//   $env:SCENARIO="spike"
+//   k6 run k6_script.js
+//
+// 실행 (동시성/시간 직접 지정, 작은 테스트 기본 시나리오에 한해 CLI로 덮어쓰기 가능):
 //   k6 run --vus 20 --duration 30s k6_script.js
-//   (동시 사용자 수·시간은 필요에 맞게 --vus, --duration으로 조절)
-//
-// 참고: k6는 Go 런타임 기반이라 Locust(Python)보다 가상 사용자당 오버헤드가 훨씬 작다.
-// 실제 티켓팅 오픈런처럼 "짧은 시간에 수천 VU가 동시에 몰리는" 시나리오를 재현하려면
-// k6가 더 적합하고, ramping-vus 시나리오(아래 옵션 참고)로 순간 스파이크도 흉내낼 수 있다.
 
 import http from "k6/http";
 import { check, sleep } from "k6";
 
 const BASE_URL = __ENV.BASE_URL || "https://vlur.site"; // 스테이징/로컬로 바꿔서 사용
 const SITE_KEY = __ENV.SITE_KEY || "여기에_실제_사이트키";
+const ORIGIN = __ENV.ORIGIN || "http://localhost"; // Site Key에 등록한 도메인과 반드시 일치해야 함
+const SCENARIO = __ENV.SCENARIO || "small";
 
-export const options = {
-  // 고정 동시성 대신, 실제 티켓팅 오픈 순간처럼 짧게 스파이크를 주는 시나리오.
-  // vus/duration을 CLI로 넘기면 이 scenarios 대신 그 값이 우선 적용된다.
-  scenarios: {
+const SCENARIOS = {
+  // 기본값: 인증·기본 동작 확인용 소규모 테스트. 실제 DB에 몇십 건만 쌓인다.
+  small: {
+    smoke: {
+      executor: "constant-vus",
+      vus: 5,
+      duration: "15s",
+    },
+  },
+  // 명시적으로 SCENARIO=spike로 켰을 때만 사용하는 티켓팅 오픈 스파이크 재현.
+  spike: {
     ticketing_spike: {
       executor: "ramping-vus",
       startVUs: 0,
@@ -35,6 +58,10 @@ export const options = {
       ],
     },
   },
+};
+
+export const options = {
+  scenarios: SCENARIOS[SCENARIO] || SCENARIOS.small,
   thresholds: {
     http_req_failed: ["rate<0.01"],     // 실패율 1% 미만 목표
     http_req_duration: ["p(95)<1000"],  // 95%가 1초 안에 응답
@@ -46,10 +73,12 @@ export default function () {
   const challengeRes = http.post(
     `${BASE_URL}/api/v1/captcha/challenge`,
     JSON.stringify({ captcha_type: "type1_drag", theme_mode: "light" }),
-    { headers: { "Content-Type": "application/json", "X-Site-Key": SITE_KEY } }
+    { headers: { "Content-Type": "application/json", "X-Site-Key": SITE_KEY, "Origin": ORIGIN } }
   );
   const challengeOk = check(challengeRes, { "challenge 200": (r) => r.status === 200 });
   if (!challengeOk) {
+    // 첫 실행에서 401/403이 나면 대부분 Site Key 오타 또는 ORIGIN이 등록 도메인과 안 맞는 경우다.
+    console.error(`challenge 실패: status=${challengeRes.status} body=${challengeRes.body}`);
     sleep(1);
     return;
   }
@@ -72,7 +101,7 @@ export default function () {
       pointer_type: "mouse",
       response_time_ms: 900,
     }),
-    { headers: { "Content-Type": "application/json", "X-Site-Key": SITE_KEY } }
+    { headers: { "Content-Type": "application/json", "X-Site-Key": SITE_KEY, "Origin": ORIGIN } }
   );
   check(verifyRes, { "verify 200": (r) => r.status === 200 });
 
